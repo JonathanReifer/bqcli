@@ -46,21 +46,26 @@ class BigQueryCompleter(Completer):
             logging.debug(f"Last token: '{last_token}'")
             logging.debug(f"Text before cursor: '{text_before_cursor}'")
 
-        if last_token.upper() in ('FROM', 'JOIN', 'SCHEMA', 'INFO', 'DETAILS'):
-            for completion in self.get_table_completions(word_before_cursor):
-                yield completion
-        elif self.is_in_column_context(document):  # Corrected here
+        # Check for column context first
+        if self.is_in_column_context(document):
             if self.dev_mode:
                 logging.debug("Context: Column")
             for completion in self.get_column_completions(word_before_cursor, document):
                 yield completion
+        # Then check for table completions
+        elif last_token.upper() in ('FROM', 'JOIN', 'SCHEMA', 'INFO', 'DETAILS'):
+            for completion in self.get_table_completions(word_before_cursor):
+                yield completion
+        # Then check for partial identifier completions
         elif '.' in word_before_cursor:
             for completion in self.get_partial_identifier_completions(word_before_cursor):
                 yield completion
+        # Finally, suggest SQL keywords
         else:
             for kw in self.all_completions:
                 if kw.upper().startswith(word_before_cursor.upper()):
                     yield Completion(kw, start_position=-len(word_before_cursor))
+
 
     def get_last_token(self, text):
         tokens = re.findall(r'\b\w+\b', text)
@@ -123,39 +128,44 @@ class BigQueryCompleter(Completer):
             table_aliases.append((table_name, alias))
         return table_aliases
 
-
-
     def is_in_column_context(self, document):
         text_before_cursor = document.text_before_cursor
-        # Remove strings and comments
-        text_before_cursor = re.sub(r"(['\"])(?:(?=(\\?))\2.)*?\1", '', text_before_cursor)  # Remove strings
-        text_before_cursor = re.sub(r'--.*', '', text_before_cursor)  # Remove single line comments
+        if self.dev_mode:
+            logging.debug(f"Text before removing strings/comments: '{text_before_cursor}'")
 
+        # Remove strings enclosed in single quotes, double quotes, or backticks
+        text_before_cursor = re.sub(r"(['\"`])(?:\\.|[^\\])*?\1", '', text_before_cursor, flags=re.DOTALL)
+        # Remove single-line comments
+        text_before_cursor = re.sub(r'--.*', '', text_before_cursor)
+        if self.dev_mode:
+            logging.debug(f"Text after removing strings/comments: '{text_before_cursor}'")
+
+        # Tokenize the text
         tokens = re.findall(r'\b\w+\b', text_before_cursor.upper())
         if not tokens:
             return False
 
-        last_token = tokens[-1]
-
         if self.dev_mode:
             logging.debug(f"Tokens before cursor: {tokens}")
-            logging.debug(f"Last token before cursor: {last_token}")
 
-        # Check if the last token is a column context keyword
-        column_context_keywords = ['SELECT', 'WHERE', 'AND', 'OR', 'ON', 'BY', 'HAVING', 'GROUP', 'ORDER']
-        if last_token in column_context_keywords:
-            return True
+        # Define keywords and operators indicating column context
+        column_context_keywords = ['SELECT', 'WHERE', 'AND', 'OR', 'ON', 'BY', 'HAVING', 'GROUP', 'ORDER', 'JOIN', 'IN', 'NOT', 'EXISTS']
+        operators = ['=', '<', '>', '<=', '>=', '<>', '!=', '+', '-', '*', '/', '%', 'LIKE', 'BETWEEN', 'IS']
 
-        # Check if the last token is an operator, indicating we're in an expression
-        operators = ['=', '<', '>', '<=', '>=', '<>', '!=', '+', '-', '*', '/', '%']
-        if last_token in operators:
-            return True
+        # Check the last few tokens for context
+        for token in reversed(tokens):
+            if token in operators or token in column_context_keywords:
+                return True
+            elif re.match(r'\w+', token):
+                # Continue checking previous tokens
+                continue
 
-        # Check if the character before the cursor is a dot or comma
-        if text_before_cursor.strip().endswith(('.', ',')):
+        # Check if the character before the cursor is a dot, comma, or operator
+        if text_before_cursor.strip() and text_before_cursor.strip()[-1] in '.=><!+-*/%(), ':
             return True
 
         return False
+
 
 
 # Helper functions

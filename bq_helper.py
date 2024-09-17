@@ -4,27 +4,46 @@ from prompt_toolkit.completion import Completer, Completion
 import logging
 from datetime import datetime, timedelta
 
-client = bigquery.Client()
-
 # Completer class for BigQuery
 class BigQueryCompleter(Completer):
-    def __init__(self):
-        self.projects = get_projects()
-        self.keywords = ['SELECT', 'FROM', 'WHERE', 'LIMIT', 'ORDER BY', 'GROUP BY', 'JOIN', 'ON',
-                         'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'DROP', 'ALTER', 'HELP', 'EXPORT',
-                         'SCHEMA', 'INFO', 'EXIT', 'QUIT']
+    def __init__(self, client):
+        self.client = client
+        self.projects = get_projects(client)
+        self.keywords = [
+            'SELECT',
+            'FROM',
+            'WHERE',
+            'LIMIT',
+            'ORDER BY',
+            'GROUP BY',
+            'JOIN',
+            'ON',
+            'INSERT',
+            'UPDATE',
+            'DELETE',
+            'CREATE',
+            'DROP',
+            'ALTER',
+            'HELP',
+            'EXPORT',
+            'SCHEMA',
+            'INFO',
+            'EXIT',
+            'QUIT',
+        ]
         self.functions = ['COUNT', 'SUM', 'MIN', 'MAX', 'AVG']
         self.all_completions = self.keywords + self.functions
+        self.table_aliases = {}  # Cache of table aliases
 
     def get_completions(self, document, complete_event):
         text_before_cursor = document.text_before_cursor
         word_before_cursor = document.get_word_before_cursor(WORD=True)
         last_token = self.get_last_token(text_before_cursor)
 
-        if last_token.upper() in ('FROM', 'JOIN',):
+        if last_token.upper() in ('FROM', 'JOIN'):
             for completion in self.get_table_completions(word_before_cursor):
                 yield completion
-        elif self.is_in_select_clause(text_before_cursor):
+        elif self.is_in_column_context(text_before_cursor):
             for completion in self.get_column_completions(word_before_cursor, text_before_cursor):
                 yield completion
         elif '.' in word_before_cursor:
@@ -48,7 +67,7 @@ class BigQueryCompleter(Completer):
         elif len(parts) == 2:
             project_id = parts[0].strip('`')
             dataset_prefix = parts[1]
-            datasets = get_datasets(project_id)
+            datasets = get_datasets(self.client, project_id)
             for dataset in datasets:
                 if dataset.startswith(dataset_prefix):
                     yield Completion(f"`{project_id}`.`{dataset}`", start_position=-len(word))
@@ -56,7 +75,7 @@ class BigQueryCompleter(Completer):
             project_id = parts[0].strip('`')
             dataset_id = parts[1].strip('`')
             table_prefix = parts[2]
-            tables = get_tables(project_id, dataset_id)
+            tables = get_tables(self.client, project_id, dataset_id)
             for table in tables:
                 if table.startswith(table_prefix):
                     yield Completion(f"`{project_id}`.`{dataset_id}`.`{table}`", start_position=-len(word))
@@ -70,7 +89,7 @@ class BigQueryCompleter(Completer):
         elif len(parts) == 2:
             project_id = parts[0].strip('`')
             dataset_prefix = parts[1]
-            datasets = get_datasets(project_id)
+            datasets = get_datasets(self.client, project_id)
             for dataset in datasets:
                 if dataset.startswith(dataset_prefix):
                     yield Completion(f"`{project_id}`.`{dataset}`", start_position=-len(word))
@@ -78,40 +97,68 @@ class BigQueryCompleter(Completer):
             project_id = parts[0].strip('`')
             dataset_id = parts[1].strip('`')
             table_prefix = parts[2]
-            tables = get_tables(project_id, dataset_id)
+            tables = get_tables(self.client, project_id, dataset_id)
             for table in tables:
                 if table.startswith(table_prefix):
                     yield Completion(f"`{project_id}`.`{dataset_id}`.`{table}`", start_position=-len(word))
 
     def get_column_completions(self, word, text_before_cursor):
-        table_full_name = self.extract_table_name(text_before_cursor)
-        if table_full_name:
+        table_aliases = self.extract_table_aliases(text_before_cursor)
+        columns = []
+        for alias, table_full_name in table_aliases.items():
             parts = table_full_name.strip('`').split('.')
             if len(parts) == 3:
                 project_id, dataset_id, table_id = parts
-                columns = get_columns(project_id, dataset_id, table_id)
-                for column in columns:
-                    if column.startswith(word):
-                        yield Completion(column, start_position=-len(word))
+                table_columns = get_columns(self.client, project_id, dataset_id, table_id)
+                if alias != table_full_name:
+                    # If there is an alias, prefix the column names with the alias
+                    table_columns = [f"{alias}.{col}" for col in table_columns]
+                columns.extend(table_columns)
+        # Remove duplicates
+        columns = list(set(columns))
+        for column in columns:
+            if column.startswith(word):
+                yield Completion(column, start_position=-len(word))
 
-    def extract_table_name(self, text):
-        pattern = re.compile(r'\bFROM\s+(.*?)\b', re.IGNORECASE | re.DOTALL)
+    def extract_table_aliases(self, text):
+        # This method extracts table names and their aliases from the query
+        table_aliases = {}
+        # Handle FROM and JOIN clauses
+        pattern = re.compile(
+            r'\b(?:FROM|JOIN)\s+(`?[^\s`]+`?)(?:\s+(?:AS\s+)?(\w+))?',
+            re.IGNORECASE
+        )
         matches = pattern.findall(text)
-        if matches:
-            last_match = matches[-1]
-            table_name = last_match.strip().strip('`').split()[0]
-            return table_name
-        return None
+        for match in matches:
+            table_name = match[0].strip('`')
+            alias = match[1] if match[1] else table_name
+            table_aliases[alias] = table_name
+        return table_aliases
 
-    def is_in_select_clause(self, text):
-        select_index = text.upper().rfind('SELECT')
-        from_index = text.upper().rfind('FROM')
-        if select_index != -1 and (from_index == -1 or select_index > from_index):
+    def is_in_column_context(self, text):
+        # Determine if the cursor is in a context where column names are expected
+        column_context_keywords = ['SELECT', 'WHERE', 'AND', 'OR', 'ON', 'GROUP BY', 'ORDER BY', 'HAVING', 'BY']
+        # Remove strings and comments
+        text = re.sub(r"(['\"])(?:(?=(\\?))\2.)*?\1", '', text)  # Remove strings
+        text = re.sub(r'--.*', '', text)  # Remove single line comments
+
+        tokens = re.findall(r'\b\w+\b', text.upper())
+        if not tokens:
+            return False
+
+        last_token = tokens[-1]
+
+        if last_token in column_context_keywords:
             return True
+
+        # Also, if the last character is a comma, it's likely we're entering a column name
+        if text.strip() and text.strip()[-1] == ',':
+            return True
+
         return False
 
 # Helper functions
-def get_projects():
+def get_projects(client):
     try:
         projects = list(client.list_projects())
         return [project.project_id for project in projects]
@@ -119,7 +166,7 @@ def get_projects():
         logging.error(f"Failed to list projects: {e}")
         return []
 
-def get_datasets(project_id):
+def get_datasets(client, project_id):
     try:
         datasets = list(client.list_datasets(project=project_id))
         return [dataset.dataset_id for dataset in datasets]
@@ -127,7 +174,7 @@ def get_datasets(project_id):
         logging.error(f"Failed to list datasets for project {project_id}: {e}")
         return []
 
-def get_tables(project_id, dataset_id):
+def get_tables(client, project_id, dataset_id):
     try:
         dataset_ref = client.dataset(dataset_id, project=project_id)
         tables = list(client.list_tables(dataset_ref))
@@ -136,7 +183,7 @@ def get_tables(project_id, dataset_id):
         logging.error(f"Failed to list tables for dataset {dataset_id}: {e}")
         return []
 
-def get_columns(project_id, dataset_id, table_id):
+def get_columns(client, project_id, dataset_id, table_id):
     try:
         table_ref = client.dataset(dataset_id, project=project_id).table(table_id)
         table = client.get_table(table_ref)
@@ -145,9 +192,9 @@ def get_columns(project_id, dataset_id, table_id):
         logging.error(f"Failed to get columns for table {table_id}: {e}")
         return []
 
-def add_default_where_clause(query):
+def add_default_where_clause(query, client):
     if 'where' not in query.lower():
-        timestamp_column = find_timestamp_column(query)
+        timestamp_column = find_timestamp_column(query, client)
         if timestamp_column:
             two_days_ago = (datetime.utcnow() - timedelta(days=2)).strftime('%Y-%m-%d %H:%M:%S')
             where_clause = f" WHERE `{timestamp_column}` >= '{two_days_ago}'"
@@ -171,28 +218,27 @@ def validate_query(client, query):
     except Exception as e:
         return False, str(e)
 
-def find_timestamp_column(query):
+def find_timestamp_column(query, client):
     table_full_name = extract_table_name(query)
     if table_full_name:
         parts = table_full_name.strip('`').split('.')
         if len(parts) == 3:
             project_id, dataset_id, table_id = parts
-            columns = get_columns_with_types(project_id, dataset_id, table_id)
+            columns = get_columns_with_types(client, project_id, dataset_id, table_id)
             for column_name, column_type in columns.items():
                 if column_type.upper() in ('TIMESTAMP', 'DATETIME', 'DATE'):
                     return column_name
     return None
 
 def extract_table_name(query):
-    pattern = re.compile(r'\bFROM\s+(.*?)\b', re.IGNORECASE | re.DOTALL)
+    pattern = re.compile(r'\bFROM\s+(`?[^\s,;`]+`?)', re.IGNORECASE)
     matches = pattern.findall(query)
     if matches:
-        last_match = matches[-1]
-        table_name = last_match.strip().strip(';').strip()
+        table_name = matches[-1].strip().strip(';')
         return table_name
     return None
 
-def get_columns_with_types(project_id, dataset_id, table_id):
+def get_columns_with_types(client, project_id, dataset_id, table_id):
     try:
         table_ref = client.dataset(dataset_id, project=project_id).table(table_id)
         table = client.get_table(table_ref)
@@ -225,4 +271,31 @@ def show_table_info(client, table_identifier):
             print(f" - {field.name} ({field.field_type})")
     except Exception as e:
         print(f"Error retrieving information for {table_identifier}: {e}")
+
+def export_to_csv(results, file_path):
+    try:
+        import csv
+        with open(file_path, 'w', newline='') as csvfile:
+            writer = None
+            for row in results:
+                if writer is None:
+                    writer = csv.DictWriter(csvfile, fieldnames=row.keys())
+                    writer.writeheader()
+                writer.writerow(dict(row))
+        print(f"Results exported to {file_path}")
+        logging.info(f"Exported results to CSV: {file_path}")
+    except Exception as e:
+        print(f"Error exporting to CSV: {e}")
+        logging.error(f"Error exporting to CSV: {e}")
+
+def export_to_json(results, file_path):
+    try:
+        data = [dict(row) for row in results]
+        with open(file_path, 'w') as jsonfile:
+            json.dump(data, jsonfile, indent=4, default=str)
+        print(f"Results exported to {file_path}")
+        logging.info(f"Exported results to JSON: {file_path}")
+    except Exception as e:
+        print(f"Error exporting to JSON: {e}")
+        logging.error(f"Error exporting to JSON: {e}")
 

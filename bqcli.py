@@ -6,12 +6,25 @@ from prompt_toolkit.lexers import PygmentsLexer
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from pygments.lexers.sql import SqlLexer
-from bq_helper import BigQueryCompleter, add_default_where_clause, add_limit_clause, validate_query, show_schema, show_table_info
-from prompt_toolkit.styles import Style  # Correct import
+from prompt_toolkit.styles import Style
+import sys
+from bq_helper import (
+    BigQueryCompleter,
+    add_default_where_clause,
+    add_limit_clause,
+    validate_query,
+    show_schema,
+    show_table_info,
+    export_to_csv,
+    export_to_json,
+)
 
 # Configure Logging
-logging.basicConfig(filename='bq_cli.log', level=logging.INFO,
-                    format='%(asctime)s %(levelname)s:%(message)s')
+logging.basicConfig(
+    filename='bq_cli.log',
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s:%(message)s',
+)
 
 # Initialize BigQuery client
 def initialize_client():
@@ -29,12 +42,16 @@ def main():
     print("Type 'help' for instructions or 'exit' to quit.\n")
 
     # Define a custom style for the prompt
-    custom_style = Style.from_dict({
-        # User input (default text).
-        '':          '#ff0066',
-        # Prompt.
-        'prompt':    'ansigreen bold',
-    })
+    custom_style = Style.from_dict(
+        {
+            # User input (default text).
+            '': '#ff0066',
+            # Prompt.
+            'prompt': 'ansigreen bold',
+        }
+    )
+
+    completer = BigQueryCompleter(client)  # Pass the client to the completer
 
     session = PromptSession(
         lexer=PygmentsLexer(SqlLexer),
@@ -42,14 +59,13 @@ def main():
         auto_suggest=AutoSuggestFromHistory(),
         multiline=True,
         style=custom_style,
+        completer=completer,
     )
-
-    completer = BigQueryCompleter()
 
     while True:
         try:
             # Get user input for the query
-            user_input = session.prompt('bq> ', completer=completer)
+            user_input = session.prompt('bq> ')
 
             if not user_input.strip():
                 continue
@@ -92,7 +108,7 @@ def main():
 
             # Add default WHERE clause and LIMIT
             if user_input.strip().lower().startswith('select'):
-                modified_query = add_default_where_clause(user_input)
+                modified_query = add_default_where_clause(user_input, client)
                 modified_query = add_limit_clause(modified_query)
             else:
                 modified_query = user_input
@@ -125,7 +141,8 @@ def main():
             logging.info(f"Executed Query: {modified_query}")
 
         except KeyboardInterrupt:
-            continue
+            print("\nExiting BigQuery CLI Tool.")
+            sys.exit(0)  # Exit the script immediately
         except Exception as e:
             print(f"Error: {e}")
             logging.error(f"Error executing query: {e}")
@@ -153,8 +170,42 @@ Features:
     print(help_text)
 
 def handle_export(command):
-    # Implementation remains the same as before
-    pass
+    parts = command.strip().split()
+    if len(parts) >= 4 and parts[1].lower() == 'to':
+        fmt = parts[2].lower()
+        file_path = ' '.join(parts[3:]).strip("'\"")
+        if fmt not in ('csv', 'json'):
+            print("Unsupported format. Supported formats are CSV and JSON.")
+            return
+
+        # Retrieve the last query from history
+        try:
+            with open('.bq_cli_history', 'r') as f:
+                history = f.readlines()
+            # Find the last executed query
+            last_query = ''
+            for line in reversed(history):
+                if line.strip() and not line.strip().lower().startswith('export'):
+                    last_query = line.strip()
+                    break
+            if not last_query:
+                raise ValueError("No previous query found.")
+        except Exception as e:
+            print("No query found to export.")
+            logging.error(f"Export failed: {e}")
+            return
+
+        # Execute the last query again
+        query_job = client.query(last_query)
+        results = query_job.result()
+
+        # Export results
+        if fmt == 'csv':
+            export_to_csv(results, file_path)
+        elif fmt == 'json':
+            export_to_json(results, file_path)
+    else:
+        print("Invalid export command. Usage: EXPORT TO <format> '<file_path>'")
 
 if __name__ == '__main__':
     main()

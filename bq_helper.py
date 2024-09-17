@@ -15,7 +15,7 @@ def get_projects(client):
 
 def get_datasets(client, project_id):
     datasets = []
-    project_id = project_id.replace('`', '').strip()
+    project_id = project_id.strip()
     try:
         for dataset in client.list_datasets(project=project_id):
             datasets.append(dataset.dataset_id)
@@ -25,8 +25,8 @@ def get_datasets(client, project_id):
 
 def get_tables(client, project_id, dataset_id):
     tables = []
-    project_id = project_id.replace('`', '').strip()
-    dataset_id = dataset_id.replace('`', '').strip()
+    project_id = project_id.strip()
+    dataset_id = dataset_id.strip()
     try:
         dataset_ref = bigquery.DatasetReference(project_id, dataset_id)
         for table in client.list_tables(dataset_ref):
@@ -78,7 +78,7 @@ class BigQueryCompleter(Completer):
 
     def get_completions(self, document, complete_event):
         text_before_cursor = document.text_before_cursor
-        word_before_cursor = document.get_word_before_cursor(WORD=True)
+        word_before_cursor = document.get_word_before_cursor(WORD=False)
         last_token = self.get_last_token(text_before_cursor)
 
         if self.dev_mode:
@@ -86,21 +86,42 @@ class BigQueryCompleter(Completer):
             logging.debug(f"Last token: '{last_token}'")
             logging.debug(f"Text before cursor: '{text_before_cursor}'")
 
-        # If word contains a dot, use partial identifier completions
-        if '.' in word_before_cursor or word_before_cursor.endswith('.'):
-            for completion in self.get_partial_identifier_completions(word_before_cursor):
-                yield completion
-        elif last_token.upper() in ('FROM', 'JOIN', 'SCHEMA', 'INFO', 'DETAILS'):
-            if self.dev_mode:
-                logging.debug("Context: Table")
-            for completion in self.get_table_completions(word_before_cursor):
-                yield completion
+        # Determine context based on the last significant keyword
+        tokens = re.findall(r'\b\w+\b', text_before_cursor.upper())
+        last_keyword = ''
+        for token in reversed(tokens):
+            if token in self.keywords:
+                last_keyword = token
+                break
+
+        if self.dev_mode:
+            logging.debug(f"Last keyword: '{last_keyword}'")
+
+        if last_keyword in ('FROM', 'JOIN', 'INTO', 'UPDATE', 'TABLE', 'DELETE', 'INSERT', 'INFO', 'SCHEMA', 'DETAILS'):
+            # Table context
+            pattern = re.compile(r'(FROM|JOIN|INTO|UPDATE|TABLE|DELETE|INSERT|INFO|SCHEMA|DETAILS)\s+(.*)', re.IGNORECASE | re.DOTALL)
+            match = pattern.search(text_before_cursor)
+            if match:
+                identifier = match.group(2).strip()
+                if self.dev_mode:
+                    logging.debug(f"Identifier for completion: '{identifier}'")
+                if identifier.endswith('.'):
+                    for completion in self.get_partial_identifier_completions(identifier):
+                        yield completion
+                else:
+                    for completion in self.get_table_completions(identifier):
+                        yield completion
+            else:
+                # No identifier found; suggest project IDs
+                for completion in self.get_table_completions(''):
+                    yield completion
         elif self.is_in_column_context(document):
             if self.dev_mode:
                 logging.debug("Context: Column")
             for completion in self.get_column_completions(word_before_cursor, document):
                 yield completion
         else:
+            # Suggest keywords and functions
             for kw in self.all_completions:
                 if kw.upper().startswith(word_before_cursor.upper()):
                     yield Completion(kw, start_position=-len(word_before_cursor))
@@ -109,118 +130,76 @@ class BigQueryCompleter(Completer):
     def get_last_token(self, text):
         # Remove comments
         text = re.sub(r'--.*', '', text)
-        # Remove strings
-        text = re.sub(r"(['\"`])(?:\\.|[^\\])*?\1", '', text)
+        # Remove strings and backtick-enclosed identifiers
+        text = re.sub(r"(['\"])(?:\\.|[^\\])*?\1", '', text)
+        text = re.sub(r'`[^`]*`', '', text)
+        # Split by whitespace and non-word characters
         tokens = re.findall(r'\b\w+\b', text)
         return tokens[-1] if tokens else ''
 
     def get_table_completions(self, word):
-        # Remove backticks from the word
+        """
+        Provide completions for table names when last token is FROM, JOIN, etc.
+        """
+        # Suggest project IDs
         word_clean = word.replace('`', '')
-        # Handle trailing dot
-        if word_clean.endswith('.'):
-            word_clean = word_clean[:-1]
-            trailing_dot = True
-        else:
-            trailing_dot = False
-        # Split the word by '.' to get parts
-        parts = word_clean.split('.')
-        if trailing_dot:
-            parts.append('')
-        parts = [part.strip() for part in parts if part.strip()]  # Remove empty strings and whitespace
+        for project in self.projects:
+            if project.startswith(word_clean):
+                yield Completion(f'`{project}`', start_position=-len(word))
+
+    def get_partial_identifier_completions(self, identifier):
         if self.dev_mode:
-            logging.debug(f"get_table_completions called with word: '{word}', parts: {parts}")
+            logging.debug(f"get_partial_identifier_completions called with identifier: '{identifier}'")
 
-        if len(parts) == 0:
-            # No parts typed yet, suggest project IDs
-            for project in self.projects:
-                if project.startswith(word_clean):
-                    yield Completion(f'`{project}`', start_position=-len(word))
-        elif len(parts) == 1:
-            # Project ID is typed, suggest datasets
-            project_id = parts[0]
-            datasets = get_datasets(self.client, project_id)
-            if self.dev_mode:
-                logging.debug(f"Datasets in project '{project_id}': {datasets}")
-            for dataset in datasets:
-                full_name = f'`{project_id}`.`{dataset}`'
-                yield Completion(full_name, start_position=-len(word))
-        elif len(parts) == 2:
-            project_id, dataset_id = parts
-            # Suggest tables in the dataset
-            tables = get_tables(self.client, project_id, dataset_id)
-            if self.dev_mode:
-                logging.debug(f"Tables in dataset '{project_id}.{dataset_id}': {tables}")
-            for table in tables:
-                full_name = f'`{project_id}`.`{dataset_id}`.`{table}`'
-                yield Completion(full_name, start_position=-len(word))
-        else:
-            # Full table identifier is typed; no further completions
-            pass
-
-
-    def get_partial_identifier_completions(self, word):
-        """
-        Provide completions for partially typed identifiers.
-        This is called when a dot is in the word before the cursor.
-        """
+        # Remove backticks and split the identifier by '.'
+        identifier_clean = identifier.replace('`', '')
+        parts = identifier_clean.split('.')
+        partial_name = parts[-1]
         if self.dev_mode:
-            logging.debug(f"get_partial_identifier_completions called with word: '{word}'")
-
-        # Remove backticks and split the word by '.'
-        parts = re.split(r'\.`?|`?\.', word)
-        parts = [part.replace('`', '').strip() for part in parts]
-        if self.dev_mode:
-            logging.debug(f"Parts after splitting: {parts}")
-
-        # Handle empty parts (e.g., when the user types a period at the end)
-        if word.endswith('.'):
-            parts.append('')
+            logging.debug(f"Parts after splitting: {parts}, Partial name: '{partial_name}'")
 
         if len(parts) == 1:
-            # Suggest datasets in the project
-            project_id = parts[0]
-            datasets = get_datasets(self.client, project_id)
-            if self.dev_mode:
-                logging.debug(f"Datasets in project '{project_id}': {datasets}")
-            for dataset in datasets:
-                full_name = f'`{project_id}`.`{dataset}`'
-                yield Completion(full_name, start_position=-len(word))
-        elif len(parts) == 2:
-            project_id, dataset_id = parts[0], parts[1]
-            if dataset_id == '':
-                # User typed 'project_id.', suggest datasets
+            # User has typed 'project_id' or 'project_id_partial'
+            project_id_partial = parts[0]
+            matching_projects = [proj for proj in self.projects if proj.startswith(project_id_partial)]
+            for project_id in matching_projects:
                 datasets = get_datasets(self.client, project_id)
                 if self.dev_mode:
                     logging.debug(f"Datasets in project '{project_id}': {datasets}")
                 for dataset in datasets:
-                    full_name = f'`{project_id}`.`{dataset}`'
-                    yield Completion(full_name, start_position=-len(word))
-            else:
-                # Suggest tables in the dataset
-                tables = get_tables(self.client, project_id, dataset_id)
-                if self.dev_mode:
-                    logging.debug(f"Tables in dataset '{project_id}.{dataset_id}': {tables}")
-                for table in tables:
-                    full_name = f'`{project_id}`.`{dataset_id}`.`{table}`'
-                    yield Completion(full_name, start_position=-len(word))
+                    # Suggest dataset names with backticks
+                    completion_text = f'`{project_id}`.`{dataset}`'
+                    display_text = f'{project_id}.{dataset}'
+                    # Calculate start_position to replace the partial project ID
+                    start_position = -len(identifier) + len(project_id_partial)
+                    yield Completion(completion_text, display=display_text, start_position=start_position)
+        elif len(parts) == 2:
+            project_id, dataset_id_partial = parts
+            datasets = get_datasets(self.client, project_id)
+            if self.dev_mode:
+                logging.debug(f"Datasets in project '{project_id}': {datasets}")
+            for dataset in datasets:
+                if dataset.startswith(dataset_id_partial):
+                    # Suggest dataset names
+                    completion_text = f'`{dataset}`'
+                    display_text = dataset
+                    start_position = -len(partial_name)
+                    yield Completion(completion_text, display=display_text, start_position=start_position)
         elif len(parts) == 3:
-            project_id, dataset_id, table_id = parts
-            if table_id == '':
-                # User typed 'project_id.dataset_id.', suggest tables
-                tables = get_tables(self.client, project_id, dataset_id)
-                if self.dev_mode:
-                    logging.debug(f"Tables in dataset '{project_id}.{dataset_id}': {tables}")
-                for table in tables:
-                    full_name = f'`{project_id}`.`{dataset_id}`.`{table}`'
-                    yield Completion(full_name, start_position=-len(word))
-            else:
-                # Full table identifier is typed; no further completions
-                pass
+            project_id, dataset_id, table_id_partial = parts
+            tables = get_tables(self.client, project_id, dataset_id)
+            if self.dev_mode:
+                logging.debug(f"Tables in dataset '{project_id}.{dataset_id}': {tables}")
+            for table in tables:
+                if table.startswith(table_id_partial):
+                    # Suggest table names
+                    completion_text = f'`{table}`'
+                    display_text = table
+                    start_position = -len(partial_name)
+                    yield Completion(completion_text, display=display_text, start_position=start_position)
         else:
-            # Invalid identifier; no completions
+            # No completions
             pass
-
 
     def get_column_completions(self, word, document):
         table_aliases = self.extract_table_aliases(document.text)
@@ -290,24 +269,18 @@ class BigQueryCompleter(Completer):
             logging.debug(f"Tokens before cursor: {tokens}")
 
         # Define keywords indicating column or table context
-        column_context_keywords = {'SELECT', 'WHERE', 'AND', 'OR', 'ON', 'BY', 'HAVING', 'GROUP', 'ORDER', 'IN', 'NOT', 'EXISTS'}
-        table_context_keywords = {'FROM', 'JOIN', 'INTO', 'UPDATE', 'TABLE', 'DELETE', 'INSERT'}
-        operators = {'=', '<', '>', '<=', '>=', '<>', '!=', '+', '-', '*', '/', '%', 'LIKE', 'BETWEEN', 'IS'}
+        column_context_keywords = {'SELECT', 'WHERE', 'AND', 'OR', 'ON', 'BY', 'HAVING', 'GROUP', 'ORDER', 'IN', 'NOT', 'EXISTS', 'VALUES', 'SET'}
+        table_context_keywords = {'FROM', 'JOIN', 'INTO', 'UPDATE', 'TABLE', 'DELETE', 'INSERT', 'INFO', 'SCHEMA', 'DETAILS'}
+        operators = {'=', '<', '>', '<=', '>=', '<>', '!=', '+', '-', '*', '/', '%', 'LIKE', 'BETWEEN', 'IS', 'IN'}
 
         # Check the last tokens to determine context
         for token in reversed(tokens):
-            if token in table_context_keywords:
-                # We're in a table context, not a column context
-                return False
-            elif token in column_context_keywords or token in operators:
+            if token in column_context_keywords or token in operators:
                 return True
+            elif token in table_context_keywords:
+                return False
             elif re.match(r'\w+', token):
-                # Continue checking previous tokens
                 continue
-
-        # Check if the character before the cursor suggests a column context
-        if text_before_cursor.strip() and text_before_cursor.strip()[-1] in '.=><!+-*/%(), ':
-            return True
 
         return False
 
@@ -396,4 +369,6 @@ def show_table_info(client, table_identifier):
             print(f" - {field.name} ({field.field_type})")
     except Exception as e:
         print(f"Error retrieving information for {table_identifier}: {e}")
+
+
 

@@ -1,0 +1,5 @@
+venv_*
+__pycache__/
+*.log
+.env
+.bq_cli_history

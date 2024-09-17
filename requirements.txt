@@ -1,0 +1,4 @@
+google-cloud-bigquery
+prompt_toolkit
+pygments
+

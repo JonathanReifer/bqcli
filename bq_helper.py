@@ -6,8 +6,9 @@ from datetime import datetime, timedelta
 
 # Completer class for BigQuery
 class BigQueryCompleter(Completer):
-    def __init__(self, client):
+    def __init__(self, client, dev_mode=False):
         self.client = client
+        self.dev_mode = dev_mode
         self.projects = get_projects(client)
         self.keywords = [
             'SELECT',
@@ -40,10 +41,17 @@ class BigQueryCompleter(Completer):
         word_before_cursor = document.get_word_before_cursor(WORD=True)
         last_token = self.get_last_token(text_before_cursor)
 
+        if self.dev_mode:
+            logging.debug(f"get_completions called with word: '{word_before_cursor}'")
+            logging.debug(f"Last token: '{last_token}'")
+            logging.debug(f"Text before cursor: '{text_before_cursor}'")
+
         if last_token.upper() in ('FROM', 'JOIN', 'SCHEMA', 'INFO', 'DETAILS'):
             for completion in self.get_table_completions(word_before_cursor):
                 yield completion
         elif self.is_in_column_context(text_before_cursor):
+            if self.dev_mode:
+                logging.debug("Context: Column")
             for completion in self.get_column_completions(word_before_cursor, text_before_cursor):
                 yield completion
         elif '.' in word_before_cursor:
@@ -60,6 +68,8 @@ class BigQueryCompleter(Completer):
 
     def get_table_completions(self, word):
         parts = word.strip('`').split('.')
+        if self.dev_mode:
+            logging.debug(f"get_table_completions called with parts: {parts}")
         if len(parts) == 1:
             for project in self.projects:
                 if project.startswith(parts[0]):
@@ -82,6 +92,8 @@ class BigQueryCompleter(Completer):
 
     def get_partial_identifier_completions(self, word):
         parts = word.strip('`').split('.')
+        if self.dev_mode:
+            logging.debug(f"get_partial_identifier_completions called with parts: {parts}")
         if len(parts) == 1:
             for project in self.projects:
                 if project.startswith(parts[0]):
@@ -104,12 +116,19 @@ class BigQueryCompleter(Completer):
 
     def get_column_completions(self, word, text_before_cursor):
         table_aliases = self.extract_table_aliases(text_before_cursor)
+        if self.dev_mode:
+            logging.debug(f"Extracted table aliases: {table_aliases}")
         columns = []
         for alias, table_full_name in table_aliases.items():
-            parts = table_full_name.strip('`').split('.')
+            # Remove backticks from each part of the table name
+            parts = [part.replace('`', '').strip() for part in table_full_name.split('.')]
             if len(parts) == 3:
                 project_id, dataset_id, table_id = parts
+                if self.dev_mode:
+                    logging.debug(f"Fetching columns for {project_id}.{dataset_id}.{table_id}")
                 table_columns = get_columns(self.client, project_id, dataset_id, table_id)
+                if self.dev_mode:
+                    logging.debug(f"Columns for {table_full_name}: {table_columns}")
                 if alias != table_full_name:
                     # If there is an alias, prefix the column names with the alias
                     table_columns = [f"{alias}.{col}" for col in table_columns]
@@ -125,13 +144,20 @@ class BigQueryCompleter(Completer):
         table_aliases = {}
         # Handle FROM and JOIN clauses
         pattern = re.compile(
-            r'\b(?:FROM|JOIN)\s+(`?[^\s`]+`?)(?:\s+(?:AS\s+)?(\w+))?',
-            re.IGNORECASE
+            r'(?:FROM|JOIN)\s+(`[^`]+`|\S+)(?:\s+(?:AS\s+)?(\w+))?',
+            re.IGNORECASE | re.MULTILINE
         )
-        matches = pattern.findall(text)
+        matches = pattern.finditer(text)
+        if self.dev_mode:
+            logging.debug(f"Extracting table aliases with pattern: {pattern}")
+            logging.debug(f"Text to search: '{text}'")
         for match in matches:
-            table_name = match[0].strip('`')
-            alias = match[1] if match[1] else table_name
+            # Remove backticks from the table name
+            table_name = match.group(1).replace('`', '').strip()
+            # Remove backticks from the alias, if present
+            alias = match.group(2).replace('`', '').strip() if match.group(2) else table_name
+            if self.dev_mode:
+                logging.debug(f"Matched table: '{table_name}', alias: '{alias}'")
             table_aliases[alias] = table_name
         return table_aliases
 
@@ -176,7 +202,7 @@ def get_datasets(client, project_id):
 
 def get_tables(client, project_id, dataset_id):
     try:
-        dataset_ref = client.dataset(dataset_id, project=project_id)
+        dataset_ref = client.dataset(dataset_id.replace('`', ''), project=project_id.replace('`', ''))
         tables = list(client.list_tables(dataset_ref))
         return [table.table_id for table in tables]
     except Exception as e:
@@ -185,6 +211,10 @@ def get_tables(client, project_id, dataset_id):
 
 def get_columns(client, project_id, dataset_id, table_id):
     try:
+        # Remove backticks from identifiers
+        project_id = project_id.replace('`', '')
+        dataset_id = dataset_id.replace('`', '')
+        table_id = table_id.replace('`', '')
         table_ref = client.dataset(dataset_id, project=project_id).table(table_id)
         table = client.get_table(table_ref)
         return [field.name for field in table.schema]
@@ -221,7 +251,7 @@ def validate_query(client, query):
 def find_timestamp_column(query, client):
     table_full_name = extract_table_name(query)
     if table_full_name:
-        parts = table_full_name.strip('`').split('.')
+        parts = [part.replace('`', '').strip() for part in table_full_name.split('.')]
         if len(parts) == 3:
             project_id, dataset_id, table_id = parts
             columns = get_columns_with_types(client, project_id, dataset_id, table_id)
@@ -234,12 +264,16 @@ def extract_table_name(query):
     pattern = re.compile(r'\bFROM\s+([^\s,;]+)', re.IGNORECASE)
     matches = pattern.findall(query)
     if matches:
-        table_name = matches[-1].strip().strip(';')
+        table_name = matches[-1].strip().strip(';').replace('`', '')
         return table_name
     return None
 
 def get_columns_with_types(client, project_id, dataset_id, table_id):
     try:
+        # Remove backticks from identifiers
+        project_id = project_id.replace('`', '')
+        dataset_id = dataset_id.replace('`', '')
+        table_id = table_id.replace('`', '')
         table_ref = client.dataset(dataset_id, project=project_id).table(table_id)
         table = client.get_table(table_ref)
         return {field.name: field.field_type for field in table.schema}
@@ -249,7 +283,7 @@ def get_columns_with_types(client, project_id, dataset_id, table_id):
 
 def show_schema(client, table_identifier):
     try:
-        table_ref = client.get_table(table_identifier)
+        table_ref = client.get_table(table_identifier.replace('`', ''))
         print(f"Schema for table {table_identifier}:")
         for field in table_ref.schema:
             print(f"{field.name} ({field.field_type})")
@@ -258,7 +292,7 @@ def show_schema(client, table_identifier):
 
 def show_table_info(client, table_identifier):
     try:
-        table_ref = client.get_table(table_identifier)
+        table_ref = client.get_table(table_identifier.replace('`', ''))
         print(f"Information for table {table_identifier}:")
         print(f"Table ID: {table_ref.full_table_id}")
         print(f"Table Type: {table_ref.table_type}")

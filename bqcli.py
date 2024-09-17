@@ -1,6 +1,7 @@
 import json
 import logging
 import sys
+import argparse
 from google.cloud import bigquery
 from prompt_toolkit import PromptSession
 from prompt_toolkit.lexers import PygmentsLexer
@@ -18,12 +19,12 @@ from bq_helper import (
     show_table_info,
 )
 
-# Configure Logging
-logging.basicConfig(
-    filename='bq_cli.log',
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s:%(message)s',
-)
+# Argument Parsing for --dev flag
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='BigQuery Interactive CLI Tool')
+    parser.add_argument('--dev', action='store_true', help='Enable developer mode with debug output')
+    args = parser.parse_args()
+    return args
 
 # Initialize BigQuery client
 def initialize_client():
@@ -34,9 +35,20 @@ def initialize_client():
         print("Authentication Error: ", e)
         sys.exit(1)
 
-client = initialize_client()
-
 def main():
+    args = parse_arguments()
+    dev_mode = args.dev
+
+    # Configure Logging
+    log_level = logging.DEBUG if dev_mode else logging.INFO
+    logging.basicConfig(
+        filename='bq_cli_debug.log' if dev_mode else 'bq_cli.log',
+        level=log_level,
+        format='%(asctime)s %(levelname)s:%(message)s',
+    )
+
+    client = initialize_client()
+
     print("Welcome to the BigQuery Interactive CLI Tool!")
     print("Type 'help' for instructions or 'exit' to quit.\n")
 
@@ -50,7 +62,7 @@ def main():
         }
     )
 
-    completer = BigQueryCompleter(client)  # Pass the client to the completer
+    completer = BigQueryCompleter(client, dev_mode=dev_mode)  # Pass the client and dev_mode to the completer
 
     # Define key bindings
     kb = KeyBindings()
@@ -104,7 +116,7 @@ def main():
             elif command.lower().startswith('schema'):
                 args = user_input.strip().split(maxsplit=1)
                 if len(args) == 2:
-                    table_identifier = args[1].strip()
+                    table_identifier = strip_backticks(args[1].strip())
                     show_schema(client, table_identifier)
                 else:
                     print("Usage: schema <project.dataset.table>")
@@ -113,7 +125,7 @@ def main():
             elif command.lower().startswith('info') or command.lower().startswith('details'):
                 args = user_input.strip().split(maxsplit=1)
                 if len(args) == 2:
-                    table_identifier = args[1].strip()
+                    table_identifier = strip_backticks(args[1].strip())
                     show_table_info(client, table_identifier)
                 else:
                     print("Usage: info <project.dataset.table>")
@@ -164,6 +176,9 @@ def main():
             print(f"Error: {e}")
             logging.error(f"Error executing query: {e}")
 
+def strip_backticks(identifier):
+    return identifier.replace('`', '')
+
 def print_help():
     help_text = """
 Available Commands:
@@ -185,6 +200,7 @@ Features:
 - Query preview and validation before execution.
 - Immediate exit on Ctrl+C.
 - Logging of executed queries.
+- Developer mode for debugging (--dev).
 """
     print(help_text)
 

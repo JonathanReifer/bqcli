@@ -1,8 +1,49 @@
 import re
+import logging
 from google.cloud import bigquery
 from prompt_toolkit.completion import Completer, Completion
-import logging
-from datetime import datetime, timedelta
+
+# Helper functions
+def get_projects(client):
+    projects = []
+    try:
+        for project in client.list_projects():
+            projects.append(project.project_id)
+    except Exception as e:
+        logging.error(f"Failed to list projects: {e}")
+    return projects
+
+def get_datasets(client, project_id):
+    datasets = []
+    project_id = project_id.replace('`', '').strip()
+    try:
+        for dataset in client.list_datasets(project=project_id):
+            datasets.append(dataset.dataset_id)
+    except Exception as e:
+        logging.error(f"Failed to list datasets in project {project_id}: {e}")
+    return datasets
+
+def get_tables(client, project_id, dataset_id):
+    tables = []
+    project_id = project_id.replace('`', '').strip()
+    dataset_id = dataset_id.replace('`', '').strip()
+    try:
+        dataset_ref = bigquery.DatasetReference(project_id, dataset_id)
+        for table in client.list_tables(dataset_ref):
+            tables.append(table.table_id)
+    except Exception as e:
+        logging.error(f"Failed to list tables in dataset {project_id}.{dataset_id}: {e}")
+    return tables
+
+def get_columns(client, project_id, dataset_id, table_id):
+    columns = []
+    try:
+        table_ref = client.dataset(dataset_id, project=project_id).table(table_id)
+        table = client.get_table(table_ref)
+        columns = [field.name for field in table.schema]
+    except Exception as e:
+        logging.error(f"Failed to get columns for table {project_id}.{dataset_id}.{table_id}: {e}")
+    return columns
 
 # Completer class for BigQuery
 class BigQueryCompleter(Completer):
@@ -34,7 +75,6 @@ class BigQueryCompleter(Completer):
         ]
         self.functions = ['COUNT', 'SUM', 'MIN', 'MAX', 'AVG']
         self.all_completions = self.keywords + self.functions
-        self.table_aliases = {}  # Cache of table aliases
 
     def get_completions(self, document, complete_event):
         text_before_cursor = document.text_before_cursor
@@ -46,21 +86,20 @@ class BigQueryCompleter(Completer):
             logging.debug(f"Last token: '{last_token}'")
             logging.debug(f"Text before cursor: '{text_before_cursor}'")
 
-        # Check for column context first
-        if self.is_in_column_context(document):
+        # If word contains a dot, use partial identifier completions
+        if '.' in word_before_cursor or word_before_cursor.endswith('.'):
+            for completion in self.get_partial_identifier_completions(word_before_cursor):
+                yield completion
+        elif last_token.upper() in ('FROM', 'JOIN', 'SCHEMA', 'INFO', 'DETAILS'):
+            if self.dev_mode:
+                logging.debug("Context: Table")
+            for completion in self.get_table_completions(word_before_cursor):
+                yield completion
+        elif self.is_in_column_context(document):
             if self.dev_mode:
                 logging.debug("Context: Column")
             for completion in self.get_column_completions(word_before_cursor, document):
                 yield completion
-        # Then check for table completions
-        elif last_token.upper() in ('FROM', 'JOIN', 'SCHEMA', 'INFO', 'DETAILS'):
-            for completion in self.get_table_completions(word_before_cursor):
-                yield completion
-        # Then check for partial identifier completions
-        elif '.' in word_before_cursor:
-            for completion in self.get_partial_identifier_completions(word_before_cursor):
-                yield completion
-        # Finally, suggest SQL keywords
         else:
             for kw in self.all_completions:
                 if kw.upper().startswith(word_before_cursor.upper()):
@@ -68,16 +107,120 @@ class BigQueryCompleter(Completer):
 
 
     def get_last_token(self, text):
+        # Remove comments
+        text = re.sub(r'--.*', '', text)
+        # Remove strings
+        text = re.sub(r"(['\"`])(?:\\.|[^\\])*?\1", '', text)
         tokens = re.findall(r'\b\w+\b', text)
         return tokens[-1] if tokens else ''
 
     def get_table_completions(self, word):
-        # Method remains the same...
-        pass
+        # Remove backticks from the word
+        word_clean = word.replace('`', '')
+        # Handle trailing dot
+        if word_clean.endswith('.'):
+            word_clean = word_clean[:-1]
+            trailing_dot = True
+        else:
+            trailing_dot = False
+        # Split the word by '.' to get parts
+        parts = word_clean.split('.')
+        if trailing_dot:
+            parts.append('')
+        parts = [part.strip() for part in parts if part.strip()]  # Remove empty strings and whitespace
+        if self.dev_mode:
+            logging.debug(f"get_table_completions called with word: '{word}', parts: {parts}")
+
+        if len(parts) == 0:
+            # No parts typed yet, suggest project IDs
+            for project in self.projects:
+                if project.startswith(word_clean):
+                    yield Completion(f'`{project}`', start_position=-len(word))
+        elif len(parts) == 1:
+            # Project ID is typed, suggest datasets
+            project_id = parts[0]
+            datasets = get_datasets(self.client, project_id)
+            if self.dev_mode:
+                logging.debug(f"Datasets in project '{project_id}': {datasets}")
+            for dataset in datasets:
+                full_name = f'`{project_id}`.`{dataset}`'
+                yield Completion(full_name, start_position=-len(word))
+        elif len(parts) == 2:
+            project_id, dataset_id = parts
+            # Suggest tables in the dataset
+            tables = get_tables(self.client, project_id, dataset_id)
+            if self.dev_mode:
+                logging.debug(f"Tables in dataset '{project_id}.{dataset_id}': {tables}")
+            for table in tables:
+                full_name = f'`{project_id}`.`{dataset_id}`.`{table}`'
+                yield Completion(full_name, start_position=-len(word))
+        else:
+            # Full table identifier is typed; no further completions
+            pass
+
 
     def get_partial_identifier_completions(self, word):
-        # Method remains the same...
-        pass
+        """
+        Provide completions for partially typed identifiers.
+        This is called when a dot is in the word before the cursor.
+        """
+        if self.dev_mode:
+            logging.debug(f"get_partial_identifier_completions called with word: '{word}'")
+
+        # Remove backticks and split the word by '.'
+        parts = re.split(r'\.`?|`?\.', word)
+        parts = [part.replace('`', '').strip() for part in parts]
+        if self.dev_mode:
+            logging.debug(f"Parts after splitting: {parts}")
+
+        # Handle empty parts (e.g., when the user types a period at the end)
+        if word.endswith('.'):
+            parts.append('')
+
+        if len(parts) == 1:
+            # Suggest datasets in the project
+            project_id = parts[0]
+            datasets = get_datasets(self.client, project_id)
+            if self.dev_mode:
+                logging.debug(f"Datasets in project '{project_id}': {datasets}")
+            for dataset in datasets:
+                full_name = f'`{project_id}`.`{dataset}`'
+                yield Completion(full_name, start_position=-len(word))
+        elif len(parts) == 2:
+            project_id, dataset_id = parts[0], parts[1]
+            if dataset_id == '':
+                # User typed 'project_id.', suggest datasets
+                datasets = get_datasets(self.client, project_id)
+                if self.dev_mode:
+                    logging.debug(f"Datasets in project '{project_id}': {datasets}")
+                for dataset in datasets:
+                    full_name = f'`{project_id}`.`{dataset}`'
+                    yield Completion(full_name, start_position=-len(word))
+            else:
+                # Suggest tables in the dataset
+                tables = get_tables(self.client, project_id, dataset_id)
+                if self.dev_mode:
+                    logging.debug(f"Tables in dataset '{project_id}.{dataset_id}': {tables}")
+                for table in tables:
+                    full_name = f'`{project_id}`.`{dataset_id}`.`{table}`'
+                    yield Completion(full_name, start_position=-len(word))
+        elif len(parts) == 3:
+            project_id, dataset_id, table_id = parts
+            if table_id == '':
+                # User typed 'project_id.dataset_id.', suggest tables
+                tables = get_tables(self.client, project_id, dataset_id)
+                if self.dev_mode:
+                    logging.debug(f"Tables in dataset '{project_id}.{dataset_id}': {tables}")
+                for table in tables:
+                    full_name = f'`{project_id}`.`{dataset_id}`.`{table}`'
+                    yield Completion(full_name, start_position=-len(word))
+            else:
+                # Full table identifier is typed; no further completions
+                pass
+        else:
+            # Invalid identifier; no completions
+            pass
+
 
     def get_column_completions(self, word, document):
         table_aliases = self.extract_table_aliases(document.text)
@@ -94,7 +237,6 @@ class BigQueryCompleter(Completer):
                 if self.dev_mode:
                     logging.debug(f"Columns for {table_full_name}: {table_columns}")
                 if alias:
-                    # Prefix column names with the alias if one is specified
                     table_columns = [f"{alias}.{col}" for col in table_columns]
                 columns.extend(table_columns)
             else:
@@ -105,7 +247,6 @@ class BigQueryCompleter(Completer):
         for column in columns:
             if column.startswith(word):
                 yield Completion(column, start_position=-len(word))
-
 
     def extract_table_aliases(self, text):
         table_aliases = []
@@ -148,69 +289,27 @@ class BigQueryCompleter(Completer):
         if self.dev_mode:
             logging.debug(f"Tokens before cursor: {tokens}")
 
-        # Define keywords and operators indicating column context
-        column_context_keywords = ['SELECT', 'WHERE', 'AND', 'OR', 'ON', 'BY', 'HAVING', 'GROUP', 'ORDER', 'JOIN', 'IN', 'NOT', 'EXISTS']
-        operators = ['=', '<', '>', '<=', '>=', '<>', '!=', '+', '-', '*', '/', '%', 'LIKE', 'BETWEEN', 'IS']
+        # Define keywords indicating column or table context
+        column_context_keywords = {'SELECT', 'WHERE', 'AND', 'OR', 'ON', 'BY', 'HAVING', 'GROUP', 'ORDER', 'IN', 'NOT', 'EXISTS'}
+        table_context_keywords = {'FROM', 'JOIN', 'INTO', 'UPDATE', 'TABLE', 'DELETE', 'INSERT'}
+        operators = {'=', '<', '>', '<=', '>=', '<>', '!=', '+', '-', '*', '/', '%', 'LIKE', 'BETWEEN', 'IS'}
 
-        # Check the last few tokens for context
+        # Check the last tokens to determine context
         for token in reversed(tokens):
-            if token in operators or token in column_context_keywords:
+            if token in table_context_keywords:
+                # We're in a table context, not a column context
+                return False
+            elif token in column_context_keywords or token in operators:
                 return True
             elif re.match(r'\w+', token):
                 # Continue checking previous tokens
                 continue
 
-        # Check if the character before the cursor is a dot, comma, or operator
+        # Check if the character before the cursor suggests a column context
         if text_before_cursor.strip() and text_before_cursor.strip()[-1] in '.=><!+-*/%(), ':
             return True
 
         return False
-
-
-
-# Helper functions
-def get_projects(client):
-    try:
-        projects = list(client.list_projects())
-        return [project.project_id for project in projects]
-    except Exception as e:
-        logging.error(f"Failed to list projects: {e}")
-        return []
-
-def get_datasets(client, project_id):
-    try:
-        datasets = list(client.list_datasets(project=project_id))
-        return [dataset.dataset_id for dataset in datasets]
-    except Exception as e:
-        logging.error(f"Failed to list datasets for project {project_id}: {e}")
-        return []
-
-def get_tables(client, project_id, dataset_id):
-    try:
-        dataset_ref = client.dataset(dataset_id.replace('`', ''), project=project_id.replace('`', ''))
-        tables = list(client.list_tables(dataset_ref))
-        return [table.table_id for table in tables]
-    except Exception as e:
-        logging.error(f"Failed to list tables for dataset {dataset_id}: {e}")
-        return []
-
-def get_columns(client, project_id, dataset_id, table_id):
-    try:
-        # Remove backticks from identifiers
-        project_id_clean = project_id.replace('`', '')
-        dataset_id_clean = dataset_id.replace('`', '')
-        table_id_clean = table_id.replace('`', '')
-        if logging.getLogger().isEnabledFor(logging.DEBUG):
-            logging.debug(f"Fetching columns for table {project_id_clean}.{dataset_id_clean}.{table_id_clean}")
-        table_ref = client.dataset(dataset_id_clean, project=project_id_clean).table(table_id_clean)
-        table = client.get_table(table_ref)
-        columns = [field.name for field in table.schema]
-        if logging.getLogger().isEnabledFor(logging.DEBUG):
-            logging.debug(f"Retrieved columns: {columns}")
-        return columns
-    except Exception as e:
-        logging.error(f"Failed to get columns for table {table_id}: {e}")
-        return []
 
 
 def add_default_where_clause(query, client):
@@ -225,6 +324,7 @@ def add_default_where_clause(query, client):
             else:
                 query += where_clause
     return query
+
 
 def add_limit_clause(query):
     if 'limit' not in query.lower():

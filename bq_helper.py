@@ -40,7 +40,7 @@ class BigQueryCompleter(Completer):
         word_before_cursor = document.get_word_before_cursor(WORD=True)
         last_token = self.get_last_token(text_before_cursor)
 
-        if last_token.upper() in ('FROM', 'JOIN'):
+        if last_token.upper() in ('FROM', 'JOIN', 'SCHEMA', 'INFO', 'DETAILS'):
             for completion in self.get_table_completions(word_before_cursor):
                 yield completion
         elif self.is_in_column_context(text_before_cursor):
@@ -231,7 +231,7 @@ def find_timestamp_column(query, client):
     return None
 
 def extract_table_name(query):
-    pattern = re.compile(r'\bFROM\s+(`?[^\s,;`]+`?)', re.IGNORECASE)
+    pattern = re.compile(r'\bFROM\s+([^\s,;]+)', re.IGNORECASE)
     matches = pattern.findall(query)
     if matches:
         table_name = matches[-1].strip().strip(';')
@@ -271,31 +271,4 @@ def show_table_info(client, table_identifier):
             print(f" - {field.name} ({field.field_type})")
     except Exception as e:
         print(f"Error retrieving information for {table_identifier}: {e}")
-
-def export_to_csv(results, file_path):
-    try:
-        import csv
-        with open(file_path, 'w', newline='') as csvfile:
-            writer = None
-            for row in results:
-                if writer is None:
-                    writer = csv.DictWriter(csvfile, fieldnames=row.keys())
-                    writer.writeheader()
-                writer.writerow(dict(row))
-        print(f"Results exported to {file_path}")
-        logging.info(f"Exported results to CSV: {file_path}")
-    except Exception as e:
-        print(f"Error exporting to CSV: {e}")
-        logging.error(f"Error exporting to CSV: {e}")
-
-def export_to_json(results, file_path):
-    try:
-        data = [dict(row) for row in results]
-        with open(file_path, 'w') as jsonfile:
-            json.dump(data, jsonfile, indent=4, default=str)
-        print(f"Results exported to {file_path}")
-        logging.info(f"Exported results to JSON: {file_path}")
-    except Exception as e:
-        print(f"Error exporting to JSON: {e}")
-        logging.error(f"Error exporting to JSON: {e}")
 

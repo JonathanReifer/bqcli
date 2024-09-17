@@ -79,8 +79,7 @@ class BigQueryCompleter(Completer):
         if self.dev_mode:
             logging.debug(f"Extracted table aliases: {table_aliases}")
         columns = []
-        for alias, table_full_name in table_aliases.items():
-            # Split the table_full_name on '.' and remove backticks
+        for table_full_name, alias in table_aliases:
             parts = [part.replace('`', '').strip() for part in table_full_name.split('.')]
             if len(parts) == 3:
                 project_id, dataset_id, table_id = parts
@@ -89,8 +88,8 @@ class BigQueryCompleter(Completer):
                 table_columns = get_columns(self.client, project_id, dataset_id, table_id)
                 if self.dev_mode:
                     logging.debug(f"Columns for {table_full_name}: {table_columns}")
-                if alias != table_full_name:
-                    # If there is an alias, prefix the column names with the alias
+                if alias:
+                    # Prefix column names with the alias if one is specified
                     table_columns = [f"{alias}.{col}" for col in table_columns]
                 columns.extend(table_columns)
             else:
@@ -104,11 +103,12 @@ class BigQueryCompleter(Completer):
 
 
     def extract_table_aliases(self, text):
-        # This method extracts table names and their aliases from the query
-        table_aliases = {}
-        # Updated regex pattern to capture full table identifiers
+        table_aliases = []
         pattern = re.compile(
-            r'(?:FROM|JOIN)\s+((?:`[^`]+`|\w+)(?:\.(?:`[^`]+`|\w+))*)(?:\s+(?:AS\s+)?(\w+))?',
+            r'(?:FROM|JOIN)\s+'
+            r'((?:`[^`]+`|\w+)(?:\.(?:`[^`]+`|\w+))*?)'
+            r'(?:\s+AS\s+(\w+))?'
+            r'(?=\s|,|$)',
             re.IGNORECASE | re.MULTILINE
         )
         matches = pattern.finditer(text)
@@ -116,19 +116,17 @@ class BigQueryCompleter(Completer):
             logging.debug(f"Extracting table aliases with pattern: {pattern}")
             logging.debug(f"Text to search: '{text}'")
         for match in matches:
-            # Remove backticks from the table name
-            table_name = match.group(1).replace('`', '').strip()
-            # Remove backticks from the alias, if present
-            alias = match.group(2).replace('`', '').strip() if match.group(2) else table_name
+            table_name = match.group(1).strip()
+            alias = match.group(2).strip() if match.group(2) else None
             if self.dev_mode:
                 logging.debug(f"Matched table: '{table_name}', alias: '{alias}'")
-            table_aliases[alias] = table_name
+            table_aliases.append((table_name, alias))
         return table_aliases
+
+
 
     def is_in_column_context(self, document):
         text_before_cursor = document.text_before_cursor
-        # Determine if the cursor is in a context where column names are expected
-        column_context_keywords = ['SELECT', 'WHERE', 'AND', 'OR', 'ON', 'GROUP BY', 'ORDER BY', 'HAVING', 'BY']
         # Remove strings and comments
         text_before_cursor = re.sub(r"(['\"])(?:(?=(\\?))\2.)*?\1", '', text_before_cursor)  # Remove strings
         text_before_cursor = re.sub(r'--.*', '', text_before_cursor)  # Remove single line comments
@@ -143,18 +141,22 @@ class BigQueryCompleter(Completer):
             logging.debug(f"Tokens before cursor: {tokens}")
             logging.debug(f"Last token before cursor: {last_token}")
 
+        # Check if the last token is a column context keyword
+        column_context_keywords = ['SELECT', 'WHERE', 'AND', 'OR', 'ON', 'BY', 'HAVING', 'GROUP', 'ORDER']
         if last_token in column_context_keywords:
             return True
 
-        # Check if the character before the cursor is a dot, indicating potential column access
-        if text_before_cursor.strip().endswith('.'):
+        # Check if the last token is an operator, indicating we're in an expression
+        operators = ['=', '<', '>', '<=', '>=', '<>', '!=', '+', '-', '*', '/', '%']
+        if last_token in operators:
             return True
 
-        # Also, if the character before the cursor is a comma, it's likely we're entering a column name
-        if text_before_cursor.strip().endswith(','):
+        # Check if the character before the cursor is a dot or comma
+        if text_before_cursor.strip().endswith(('.', ',')):
             return True
 
         return False
+
 
 # Helper functions
 def get_projects(client):

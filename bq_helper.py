@@ -105,15 +105,11 @@ class BigQueryCompleter(Completer):
                 identifier = match.group(2).strip()
                 if self.dev_mode:
                     logging.debug(f"Identifier for completion: '{identifier}'")
-                if identifier.endswith('.'):
-                    for completion in self.get_partial_identifier_completions(identifier):
-                        yield completion
-                else:
-                    for completion in self.get_table_completions(identifier):
-                        yield completion
+                for completion in self.get_partial_identifier_completions(identifier):
+                    yield completion
             else:
                 # No identifier found; suggest project IDs
-                for completion in self.get_table_completions(''):
+                for completion in self.get_partial_identifier_completions(''):
                     yield completion
         elif self.is_in_column_context(document):
             if self.dev_mode:
@@ -125,7 +121,6 @@ class BigQueryCompleter(Completer):
             for kw in self.all_completions:
                 if kw.upper().startswith(word_before_cursor.upper()):
                     yield Completion(kw, start_position=-len(word_before_cursor))
-
 
     def get_last_token(self, text):
         # Remove comments
@@ -154,49 +149,43 @@ class BigQueryCompleter(Completer):
         # Remove backticks and split the identifier by '.'
         identifier_clean = identifier.replace('`', '')
         parts = identifier_clean.split('.')
-        partial_name = parts[-1]
         if self.dev_mode:
-            logging.debug(f"Parts after splitting: {parts}, Partial name: '{partial_name}'")
+            logging.debug(f"Parts after splitting: {parts}")
 
+        # Determine the part being completed and the partial text
         if len(parts) == 1:
-            # User has typed 'project_id' or 'project_id_partial'
-            project_id_partial = parts[0]
-            matching_projects = [proj for proj in self.projects if proj.startswith(project_id_partial)]
+            # Completing project ID
+            project_partial = parts[0]
+            matching_projects = [proj for proj in self.projects if project_partial.lower() in proj.lower()]
             for project_id in matching_projects:
-                datasets = get_datasets(self.client, project_id)
-                if self.dev_mode:
-                    logging.debug(f"Datasets in project '{project_id}': {datasets}")
-                for dataset in datasets:
-                    # Suggest dataset names with backticks
-                    completion_text = f'`{project_id}`.`{dataset}`'
-                    display_text = f'{project_id}.{dataset}'
-                    # Calculate start_position to replace the partial project ID
-                    start_position = -len(identifier) + len(project_id_partial)
-                    yield Completion(completion_text, display=display_text, start_position=start_position)
+                # Suggest project IDs
+                yield Completion(project_id, start_position=-len(project_partial))
         elif len(parts) == 2:
-            project_id, dataset_id_partial = parts
+            # Completing dataset ID
+            project_id, dataset_partial = parts
             datasets = get_datasets(self.client, project_id)
             if self.dev_mode:
                 logging.debug(f"Datasets in project '{project_id}': {datasets}")
             for dataset in datasets:
-                if dataset.startswith(dataset_id_partial):
-                    # Suggest dataset names
-                    completion_text = f'`{dataset}`'
-                    display_text = dataset
-                    start_position = -len(partial_name)
-                    yield Completion(completion_text, display=display_text, start_position=start_position)
+                if dataset_partial.lower() in dataset.lower():
+                    # Construct the completion text
+                    completion_text = f'{dataset}'
+                    # The user has typed 'project_id.' so we need to replace 'dataset_partial'
+                    start_position = -len(dataset_partial)
+                    yield Completion(completion_text, start_position=start_position)
         elif len(parts) == 3:
-            project_id, dataset_id, table_id_partial = parts
+            # Completing table ID
+            project_id, dataset_id, table_partial = parts
             tables = get_tables(self.client, project_id, dataset_id)
             if self.dev_mode:
                 logging.debug(f"Tables in dataset '{project_id}.{dataset_id}': {tables}")
             for table in tables:
-                if table.startswith(table_id_partial):
-                    # Suggest table names
-                    completion_text = f'`{table}`'
-                    display_text = table
-                    start_position = -len(partial_name)
-                    yield Completion(completion_text, display=display_text, start_position=start_position)
+                if table_partial.lower() in table.lower():
+                    # Construct the completion text
+                    completion_text = f'{table}'
+                    # The user has typed 'project_id.dataset_id.' so we need to replace 'table_partial'
+                    start_position = -len(table_partial)
+                    yield Completion(completion_text, start_position=start_position)
         else:
             # No completions
             pass
